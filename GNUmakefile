@@ -1,11 +1,24 @@
 # config
+#USE_OPENSSL=1
+USE_GNUTLS=1
 srcdir	= .
 VPATH	= $(srcdir)
 -include Make.config
 include $(srcdir)/mk/Variables.mk
 
+ifdef USE_OPENSSL
+SSL_DEFS=-DUSE_OPENSSL
+pkglst+=openssl
+endif
+
+ifdef USE_GNUTLS
+SSL_DEFS=-DUSE_GNUTLS
+pkglst+=gnutls
+endif
+
 CFLAGS	+= -Wall -Wno-pointer-sign
 CFLAGS	+= -DVERSION='"$(VERSION)"'
+CFLAGS  += $(SSL_DEFS)
 
 TARGETS	:= amtterm amtider
 DESKTOP := $(wildcard *.desktop)
@@ -59,9 +72,9 @@ distclean: clean
 
 #################################################################
 
-amtterm: amtterm.o redir.o tcp.o
-gamt: gamt.o redir.o tcp.o parseconfig.o
-amtider: amtider.o redir.o tcp.o
+amtterm: amtterm.o redir.o tcp.o auth.o ssl.o
+gamt: gamt.o redir.o tcp.o parseconfig.o auth.o ssl.o
+amtider: amtider.o redir.o tcp.o auth.o ssl.o
 
 #################################################################
 

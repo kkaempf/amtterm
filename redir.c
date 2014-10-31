@@ -31,9 +31,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h> 
+#include <sys/time.h>
 
 #include "tcp.h"
+#include "ssl.h"
 #include "redir.h"
+#include "auth.h"
 
 #define ISO_IMAGE "./b.iso"
 static const char *state_name[] = {
@@ -115,11 +118,12 @@ static ssize_t redir_write(struct redir *r, const char *buf, size_t count)
 {
 	int flags = fcntl(r->sock,F_GETFL);
 	fcntl(r->sock,F_SETFL, flags & (~O_NONBLOCK));
-    int rc,i;
+    int rc;
 	rc=0;
     if (r->trace)
 	hexdump("out", buf, count);
-	
+#if 0 /* old code */
+    int i;
 	char*buf2=(char *)buf;
 	int to_write=IDER_MAX_DATA_SIZE+IDER_DATA_HEADER_LEN;
 	if(buf2[0]>0x30) {
@@ -163,6 +167,9 @@ static ssize_t redir_write(struct redir *r, const char *buf, size_t count)
 		}
 	}
 	
+#endif
+    rc = sslwrite(r->ctx, buf, count); /* new, ssl code */
+
     if (-1 == rc)
 		snprintf(r->err, sizeof(r->err), "write(socket): %s", strerror(errno));
 	
@@ -205,8 +212,11 @@ const char *redir_state_desc(enum redir_state state)
 int redir_connect(struct redir *r)
 {
     static unsigned char *defport = "16994";
+    static unsigned char *sslport = "16995";
     struct addrinfo ai;
 
+    if (r->cacert)
+	defport = sslport;
     memset(&ai, 0, sizeof(ai));
     ai.ai_socktype = SOCK_STREAM;
     ai.ai_family = PF_UNSPEC;
@@ -214,6 +224,11 @@ int redir_connect(struct redir *r)
     redir_state(r, REDIR_CONNECT);
     r->sock = tcp_connect(&ai, NULL, NULL, r->host,
 			  strlen(r->port) ? r->port : defport);
+    r->ctx = sslinit(r->sock, r->cacert);
+    if(r->ctx == NULL) {
+	close(r->sock);
+	r->sock = -1;
+    }
     if (-1 == r->sock) {
         redir_state(r, REDIR_ERROR);
         /* FIXME: better error message */
@@ -242,11 +257,13 @@ int redir_stop(struct redir *r)
 
     redir_state(r, REDIR_CLOSED);
     redir_write(r, request, sizeof(request));
+    sslexit(r->ctx);
+    r->ctx = NULL;
     close(r->sock);
     return 0;
 }
 
-int redir_auth(struct redir *r)
+static int redir_auth_old(struct redir *r)
 {
     int ulen = strlen(r->user);
     int plen = strlen(r->pass);
@@ -286,6 +303,80 @@ int redir_ider_start(struct redir *r)
     };
     redir_state(r, REDIR_INIT_IDER);
     return redir_write(r, request, sizeof(request));
+}
+
+static int
+io(void *parm, unsigned char *data, int len, int mode)
+{
+    int rc;
+    struct redir *r;
+    struct timeval tv;
+    fd_set set;
+
+    switch(mode)
+    {
+    case READ:
+	r = (struct redir *)parm;
+	while (len) {
+	    FD_ZERO(&set);
+	    FD_SET(r->sock,&set);
+	    if (!sslready(r->ctx)) {
+		tv.tv_sec  = HEARTBEAT_INTERVAL * 4 / 1000;
+		tv.tv_usec = 0;
+		switch (select(r->sock+1,&set,NULL,NULL,&tv)) {
+		case -1:
+		    perror("select");
+		    return -1;
+		case 0:
+		    fprintf(stderr,"select: timeout\n");
+		    return -1;
+		}
+	    }
+	    rc = sslread(r->ctx, data, len);
+	    switch (rc) {
+	    case -1:
+		fprintf(stderr, "read(socket): %s", strerror(errno));
+		return -1;
+	    case 0:
+		fprintf(stderr, "EOF from socket");
+		return -1;
+	    default:
+		if (r->trace)
+		    hexdump("in ", data, rc);
+		data += rc;
+		len -= rc;
+	    }
+	}
+	return 0;
+
+    case WRITE:
+	r = (struct redir *)parm;
+	if (redir_write(r, data, len) != len)
+	    return -1;
+	return 0;
+
+    case RANDOM:
+	gettimeofday(&tv, NULL);
+	if (sizeof(tv) <= len)
+	    memcpy(data, &tv, sizeof(tv));
+	else
+	    memcpy(data, &tv, len);
+	return 0;
+    }
+
+    return -1;
+}
+
+int redir_auth(struct redir *r)
+{
+    int rc;
+
+    if (r->legacy)
+	return redir_auth_old(r);
+
+    redir_state(r, REDIR_AUTH);
+    rc = authenticate(0, r->user, r->pass, io, r);
+    return rc;
 }
 
 int redir_sol_start(struct redir *r)
@@ -387,7 +478,7 @@ int redir_sol_recv(struct redir *r)
 	   ready yet, but should be here Real Soon Now. */
 	flags = fcntl(r->sock,F_GETFL);
 	fcntl(r->sock,F_SETFL, flags & (~O_NONBLOCK));
-	count = read(r->sock, msg, count);
+	count = sslread(r->ctx, msg, count);
 	fcntl(r->sock,F_SETFL, flags);
 
 	switch (count) {
@@ -788,18 +879,15 @@ static int powered_off = 0;
 int redir_data(struct redir *r)
 {
     int rc, bshift, i;
-	
-	
+
+repeat:
+
     if (r->trace) {
 	//fprintf(stderr, "in --\n");
 	if (r->blen)
 	    fprintf(stderr, "in : already have %d\n", r->blen);
     }
-	
-    rc = read(r->sock, r->buf + r->blen, sizeof(r->buf) - r->blen);
-	
-	
-
+    rc = sslread(r->ctx, r->buf + r->blen, sizeof(r->buf) - r->blen);
     switch (rc) {
 		case -1:
 			snprintf(r->err, sizeof(r->err), "read(socket): %s", strerror(errno));
@@ -1026,18 +1114,24 @@ int redir_data(struct redir *r)
 	memmove(r->buf, r->buf + bshift, r->blen - bshift);
 	r->blen -= bshift;
     }
+    if (r->ctx && sslready(r->ctx))
+	goto repeat;
     return 0;
 
 again:
     /* need more data, jump back into poll/select loop */
     if (r->trace)
 	fprintf(stderr, "in : need more data\n");
+    if (sslready(r->ctx))
+	goto repeat;
     return 0;
 
 err:
     if (r->trace)
 	fprintf(stderr, "in : ERROR (%s)\n", r->err);
     redir_state(r, REDIR_ERROR);
+    sslexit(r->ctx);
+    r->ctx = NULL;
     close(r->sock);
     return -1;
 }
