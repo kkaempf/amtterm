@@ -1,0 +1,6 @@
+*.o
+amtterm
+amtider
+*~
+Make.config
+mk/*.dep
